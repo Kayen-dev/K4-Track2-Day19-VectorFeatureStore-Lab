@@ -17,6 +17,7 @@
 # %%
 import _setup  # noqa: F401
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,6 +27,7 @@ REPO_ROOT = Path(_setup.__file__).resolve().parent.parent
 FEAST_DIR = REPO_ROOT / "app" / "feast_repo"
 FEAST_DATA = FEAST_DIR / "data"
 FEAST_DATA.mkdir(exist_ok=True)
+FEAST = Path(sys.executable).with_name("feast.exe" if sys.platform == "win32" else "feast")
 
 # %% [markdown]
 # ## 1. Sinh dữ liệu offline (Parquet) cho 3 feature views
@@ -84,7 +86,7 @@ for p in sorted(FEAST_DATA.glob("*.parquet")):
 
 # %%
 res = subprocess.run(
-    ["feast", "apply"],
+    [str(FEAST), "apply"],
     cwd=str(FEAST_DIR),
     capture_output=True, text=True, check=False,
 )
@@ -95,6 +97,21 @@ if res.stderr:
     print(res.stderr)
 assert res.returncode == 0, f"feast apply failed: {res.stderr}"
 
+# Show the registry state explicitly. On a clean run `apply` says "Created";
+# on a repeated run it may say "Updated" or "No changes", while this listing
+# always proves that all three required views are registered and online-enabled.
+listed = subprocess.run(
+    [str(FEAST), "feature-views", "list"],
+    cwd=str(FEAST_DIR),
+    capture_output=True, text=True, check=True,
+)
+print("Registered feature views:")
+print(listed.stdout)
+for required_view in (
+    "user_profile_features", "item_popularity_features", "query_velocity_features"
+):
+    assert required_view in listed.stdout
+
 # %% [markdown]
 # ## 3. `feast materialize-incremental` — load offline → online
 #
@@ -104,7 +121,7 @@ assert res.returncode == 0, f"feast apply failed: {res.stderr}"
 # %%
 end_dt = NOW.strftime("%Y-%m-%dT%H:%M:%S")
 res = subprocess.run(
-    ["feast", "materialize-incremental", end_dt],
+    [str(FEAST), "materialize-incremental", end_dt],
     cwd=str(FEAST_DIR),
     capture_output=True, text=True, check=False,
 )
@@ -147,7 +164,7 @@ print(f"Single lookup: {single_latency_ms:.2f}ms")
 print({k: v[0] for k, v in features.items()})
 
 # %% [markdown]
-# ## 5. TODO — Batch latency benchmark (100 lookups, P99)
+# ## 5. Batch latency benchmark (100 lookups, P99)
 
 # %%
 latencies: list[float] = []
@@ -185,7 +202,9 @@ else:
 import pandas as pd
 entity_df = pd.DataFrame({
     "user_id": ["u_001", "u_002", "u_003"],
-    "event_timestamp": [NOW - timedelta(hours=2), NOW - timedelta(hours=1), NOW],
+    # Each profile event is at NOW-i hours. Query 30 minutes before NOW so all
+    # three users have a valid historical value and no future value is read.
+    "event_timestamp": [NOW - timedelta(minutes=30)] * 3,
 })
 
 historical = fs.get_historical_features(

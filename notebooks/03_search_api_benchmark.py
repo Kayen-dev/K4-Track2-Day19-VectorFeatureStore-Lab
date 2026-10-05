@@ -15,8 +15,11 @@
 
 # %%
 import _setup  # noqa: F401
+import math
+import socket
 import statistics
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -30,14 +33,24 @@ import httpx
 
 # %%
 ROOT = Path(_setup.__file__).resolve().parent.parent
+
+# Ask the OS for a free localhost port so the notebook remains reproducible
+# when :8000 is already occupied by another lab or a developer API.
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    PORT = sock.getsockname()[1]
+
 proc = subprocess.Popen(
-    ["uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
+    [sys.executable, "-m", "uvicorn", "app.main:app",
+     "--host", "127.0.0.1", "--port", str(PORT), "--log-level", "warning"],
     cwd=str(ROOT),
 )
 
 # Đợi server up + warm (Searcher.from_corpus loads embeddings + indexes 1000 docs)
-URL = "http://localhost:8000"
-for _ in range(60):
+URL = f"http://127.0.0.1:{PORT}"
+for _ in range(180):
+    if proc.poll() is not None:
+        raise RuntimeError(f"API process exited early with code {proc.returncode}")
     try:
         r = httpx.get(f"{URL}/healthz", timeout=2.0)
         if r.status_code == 200 and r.json().get("ready"):
@@ -46,7 +59,7 @@ for _ in range(60):
         pass
     time.sleep(1)
 else:
-    raise RuntimeError("API didn't become ready within 60s")
+    raise RuntimeError("API didn't become ready within 180s")
 
 print(httpx.get(f"{URL}/healthz").json())
 
@@ -63,7 +76,7 @@ for h in body["hits"][:3]:
     print(f"  {h['doc_id']:>14}  score={h['score']:.4f}  {h['title']}")
 
 # %% [markdown]
-# ## 3. TODO — Latency benchmark (100 queries × 3 modes)
+# ## 3. Latency benchmark (100 queries × 3 modes)
 #
 # Dùng 50 golden queries × 2 reps = 100 calls/mode. Ghi nhận latency từ
 # `body["latency_ms"]` (server-side, đã trừ network) HOẶC từ wall-clock httpx
@@ -77,12 +90,24 @@ import json
 DATA = ROOT / "data"
 golden = [json.loads(l) for l in (DATA / "golden_set.jsonl").open(encoding="utf-8")]
 
+# Reuse one connection, as a real service client would, and warm every route
+# before recording tail latency. This excludes model/runtime cold-start work
+# while keeping the complete server-side search path in the measurement.
+bench_client = httpx.Client(base_url=URL, timeout=10.0)
+for warm_mode in ("keyword", "semantic", "hybrid"):
+    for q in golden[:10]:
+        warm = bench_client.get("/search", params={"q": q["query"], "mode": warm_mode})
+        warm.raise_for_status()
+
 
 def percentile(values: list[float], p: float) -> float:
     n = len(values)
     if n == 0:
         return 0.0
-    return sorted(values)[min(int(n * p), n - 1)]
+    # Nearest-rank percentile. For 100 samples P99 is item 99 (zero-index 98),
+    # not the maximum; int(n*p) is off by one at exact integer ranks.
+    rank = max(1, math.ceil(n * p))
+    return sorted(values)[rank - 1]
 
 
 def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
@@ -91,7 +116,8 @@ def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
     for _ in range(reps):
         for q in golden:
             t0 = time.perf_counter()
-            r = httpx.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
+            r = bench_client.get("/search", params={"q": q["query"], "mode": mode})
+            r.raise_for_status()
             wall_latencies.append((time.perf_counter() - t0) * 1000)
             server_latencies.append(r.json()["latency_ms"])
     return {
@@ -127,8 +153,14 @@ else:
 # ## 5. Cleanup — stop the API server
 
 # %%
-proc.terminate()
-proc.wait(timeout=5)
+bench_client.close()
+if proc.poll() is None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
 print("API server stopped")
 
 # %% [markdown]
